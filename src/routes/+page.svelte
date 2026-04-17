@@ -29,6 +29,85 @@
     ontologies?: Record<string, unknown>;
   }
 
+  interface V5OntologyFile {
+    version: 5;
+    format: string;
+    metadata: Record<string, unknown>;
+    ontologies: Record<string, { name: string; path: string }>;
+    mergedData: unknown;
+    nodeIdMap: Record<string, string>;
+    provenance: Record<string, { sources: Array<{ panel: string; originalPath: string; action: string }> }>;
+    concepts: Record<string, ConceptMeta>;
+    llmSuggestions?: unknown;
+    pendingReview?: unknown[];
+  }
+
+  /**
+   * Convert a v5 name-keyed tree to a v4 ID-keyed structure.
+   * Uses the concepts registry to resolve names → IDs.
+   * Names without a matching ID get a freshly minted <MERGED-*> ID.
+   */
+  function v5ToV4(v5: V5OntologyFile): V4OntologyFile {
+    const conceptsCopy = { ...v5.concepts };
+
+    // Build name → ID reverse lookup (first match wins per source priority)
+    const nameToId = new Map<string, string>();
+    for (const [id, meta] of Object.entries(conceptsCopy)) {
+      if (!nameToId.has(meta.name)) {
+        nameToId.set(meta.name, id);
+      }
+    }
+
+    function resolveId(name: string): string {
+      const existing = nameToId.get(name);
+      if (existing) return existing;
+      // Mint a new ID and add a stub concept
+      const newId = `<MERGED-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}>`;
+      nameToId.set(name, newId);
+      conceptsCopy[newId] = {
+        name,
+        synonyms: [],
+        icd_codes: [],
+        primary_reference: null,
+        related_concepts: [],
+        source: "merged",
+      };
+      return newId;
+    }
+
+    function convertTree(node: unknown): Record<string, V4StructureNode> {
+      if (!node || typeof node !== "object") return {};
+      if (Array.isArray(node)) return {};
+
+      const result: Record<string, V4StructureNode> = {};
+      for (const [name, value] of Object.entries(node as Record<string, unknown>)) {
+        const id = resolveId(name);
+        if (Array.isArray(value)) {
+          // Leaf array: resolve each item name to an ID
+          result[id] = { children: value.map((item) => resolveId(String(item))) };
+        } else if (value && typeof value === "object" && Object.keys(value).length > 0) {
+          // Inner node: recurse
+          result[id] = { children: convertTree(value) };
+        } else {
+          // Empty node (null or {})
+          result[id] = { children: {} };
+        }
+      }
+      return result;
+    }
+
+    const structure = convertTree(v5.mergedData);
+
+    return {
+      version: 4,
+      format: "id-keyed-with-metadata",
+      metadata: v5.metadata,
+      concepts: conceptsCopy,
+      structure,
+      sourceOntologies: v5.ontologies as any,
+    };
+  }
+
   let { data }: { data: { ontology: V4OntologyFile | null } } = $props();
 
   // Raw ontology object (used for export spread)
@@ -382,8 +461,13 @@
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const parsed = JSON.parse(ev.target?.result as string) as V4OntologyFile;
-        loadOntologyData(parsed);
+        const parsed = JSON.parse(ev.target?.result as string);
+        if (parsed.version === 5) {
+          const v4 = v5ToV4(parsed as V5OntologyFile);
+          loadOntologyData(v4);
+        } else {
+          loadOntologyData(parsed as V4OntologyFile);
+        }
       } catch (err) {
         console.error("Failed to parse uploaded file:", err);
       }
