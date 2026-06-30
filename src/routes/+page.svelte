@@ -42,6 +42,97 @@
     pendingReview?: unknown[];
   }
 
+  interface OntMergeV2Link {
+    id: string;
+    name: string;
+    source: string;
+    namePath?: string[];
+  }
+
+  interface OntMergeV2Node {
+    id: string;
+    name: string;
+    links: OntMergeV2Link[];
+    children: OntMergeV2Node[];
+  }
+
+  interface OntMergeV2File {
+    version: 1;
+    exportedAt?: string;
+    sources?: { left?: string; right?: string };
+    linkedOntology: OntMergeV2Node[];
+    ignoredSourceNodePaths?: Array<{ source: string; namePath: string[] }>;
+  }
+
+  function ontMergeV2ToV4(v2: OntMergeV2File): V4OntologyFile {
+    const concepts: Record<string, ConceptMeta> = {};
+    const structure: Record<string, V4StructureNode> = {};
+
+    function mintId(uuid: string, prefix: string): string {
+      const short = uuid.replace(/-/g, "").slice(0, 8);
+      return `<${prefix}-${short}>`;
+    }
+
+    function processNode(node: OntMergeV2Node): string {
+      const id = mintId(node.id, "MERGED");
+
+      // Collect link names as synonyms (deduplicated, skip exact name match)
+      const synonyms = node.links
+        .map((l) => l.name)
+        .filter((n, i, arr) => n !== node.name && arr.indexOf(n) === i);
+
+      concepts[id] = {
+        name: node.name,
+        synonyms,
+        icd_codes: [],
+        primary_reference: null,
+        related_concepts: [],
+        source: "merged",
+        createdBy: "user",
+        mergedFrom: node.links.map((l) => mintId(l.id, l.source.toUpperCase().replace(/\s+/g, ""))),
+      };
+
+      if (node.children.length === 0) {
+        structure[id] = { children: [] };
+        return id;
+      }
+
+      const childIds = node.children.map(processNode);
+      // Use dict format if any child has children, otherwise leaf array
+      const anyChildHasChildren = node.children.some((c) => c.children.length > 0);
+      if (anyChildHasChildren) {
+        const childDict: Record<string, V4StructureNode> = {};
+        for (const childId of childIds) {
+          childDict[childId] = structure[childId] ?? { children: [] };
+          delete structure[childId];
+        }
+        structure[id] = { children: childDict };
+      } else {
+        // All children are leaves
+        structure[id] = { children: childIds };
+      }
+
+      return id;
+    }
+
+    for (const rootNode of v2.linkedOntology) {
+      processNode(rootNode);
+    }
+
+    return {
+      version: 4,
+      format: "id-keyed-with-metadata",
+      metadata: {
+        source: "ontmergev2",
+        exportedAt: v2.exportedAt ?? new Date().toISOString(),
+        sourceLeft: v2.sources?.left ?? "",
+        sourceRight: v2.sources?.right ?? "",
+      },
+      concepts,
+      structure,
+    };
+  }
+
   /**
    * Convert a v5 name-keyed tree to a v4 ID-keyed structure.
    * Uses the concepts registry to resolve names → IDs.
@@ -455,21 +546,25 @@
     redoStack = [];
   }
 
+  let uploadError = $state<string | null>(null);
+
   function handleFileUpload(e: Event) {
     const file = (e.target as HTMLInputElement).files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (ev) => {
+      uploadError = null;
       try {
         const parsed = JSON.parse(ev.target?.result as string);
-        if (parsed.version === 5) {
-          const v4 = v5ToV4(parsed as V5OntologyFile);
+        if (parsed.version === 1 && Array.isArray(parsed.linkedOntology)) {
+          const v4 = ontMergeV2ToV4(parsed as OntMergeV2File);
           loadOntologyData(v4);
         } else {
-          loadOntologyData(parsed as V4OntologyFile);
+          uploadError = "Unsupported format. Please upload a JSON exported from OntMerge v2 (version 1 with linkedOntology).";
         }
       } catch (err) {
         console.error("Failed to parse uploaded file:", err);
+        uploadError = "Failed to parse file. Make sure it is a valid JSON file.";
       }
     };
     reader.readAsText(file);
@@ -677,6 +772,180 @@
     return null;
   }
 
+  // ── Drag and drop ──────────────────────────────────────────────────────────
+
+  let draggedId = $state<string | null>(null);
+  let dragOverId = $state<string | null>(null);
+  let dropEdge = $state<"before" | "after" | "into" | null>(null);
+
+  function nodeHasChildren(node: V4StructureNode): boolean {
+    return Array.isArray(node.children)
+      ? node.children.length > 0
+      : Object.keys(node.children).length > 0;
+  }
+
+  function isDescendantOf(ancestorId: string, nodeId: string): boolean {
+    const ancestorNode = findStructureNode(structure, ancestorId);
+    if (!ancestorNode) return false;
+    function walk(ch: Record<string, V4StructureNode> | string[]): boolean {
+      if (Array.isArray(ch)) return ch.includes(nodeId);
+      for (const [id, node] of Object.entries(ch)) {
+        if (id === nodeId) return true;
+        if (walk(node.children)) return true;
+      }
+      return false;
+    }
+    return walk(ancestorNode.children);
+  }
+
+  function detachFromStructure(nodeId: string): V4StructureNode {
+    if (nodeId in structure) {
+      const node = structure[nodeId];
+      const { [nodeId]: _, ...rest } = structure;
+      structure = rest;
+      return node;
+    }
+    function search(nodes: Record<string, V4StructureNode>): V4StructureNode | null {
+      for (const node of Object.values(nodes)) {
+        const ch = node.children;
+        if (Array.isArray(ch)) {
+          const idx = ch.indexOf(nodeId);
+          if (idx !== -1) { ch.splice(idx, 1); return { children: [] }; }
+        } else {
+          if (nodeId in ch) {
+            const child = ch[nodeId];
+            delete ch[nodeId];
+            return child;
+          }
+          const found = search(ch);
+          if (found !== null) return found;
+        }
+      }
+      return null;
+    }
+    return search(structure) ?? { children: [] };
+  }
+
+  function insertIntoStructure(
+    nodeId: string,
+    nodeData: V4StructureNode,
+    targetId: string,
+    position: "before" | "after" | "into",
+  ): void {
+    if (position === "into") {
+      const targetNode = findStructureNode(structure, targetId);
+      if (!targetNode) { structure[nodeId] = nodeData; return; }
+      const ch = targetNode.children;
+      if (Array.isArray(ch)) {
+        if (nodeHasChildren(nodeData)) {
+          const newCh: Record<string, V4StructureNode> = {};
+          for (const leafId of ch) newCh[leafId] = { children: [] };
+          newCh[nodeId] = nodeData;
+          targetNode.children = newCh;
+        } else {
+          (ch as string[]).push(nodeId);
+        }
+      } else {
+        (ch as Record<string, V4StructureNode>)[nodeId] = nodeData;
+      }
+      return;
+    }
+
+    // 'before' or 'after'
+    if (targetId in structure) {
+      const entries = Object.entries(structure);
+      const idx = entries.findIndex(([k]) => k === targetId);
+      entries.splice(position === "before" ? idx : idx + 1, 0, [nodeId, nodeData]);
+      structure = Object.fromEntries(entries);
+      return;
+    }
+
+    function insertNext(nodes: Record<string, V4StructureNode>): boolean {
+      for (const node of Object.values(nodes)) {
+        const ch = node.children;
+        if (Array.isArray(ch)) {
+          const idx = ch.indexOf(targetId);
+          if (idx !== -1) {
+            if (nodeHasChildren(nodeData)) {
+              // Upgrade leaf array → dict so we can hold the non-leaf
+              const newCh: Record<string, V4StructureNode> = {};
+              for (const leafId of ch) newCh[leafId] = { children: [] };
+              const entries = Object.entries(newCh);
+              const di = entries.findIndex(([k]) => k === targetId);
+              entries.splice(position === "before" ? di : di + 1, 0, [nodeId, nodeData]);
+              node.children = Object.fromEntries(entries);
+            } else {
+              ch.splice(position === "before" ? idx : idx + 1, 0, nodeId);
+            }
+            return true;
+          }
+        } else {
+          if (targetId in ch) {
+            const entries = Object.entries(ch);
+            const idx = entries.findIndex(([k]) => k === targetId);
+            entries.splice(position === "before" ? idx : idx + 1, 0, [nodeId, nodeData]);
+            node.children = Object.fromEntries(entries);
+            return true;
+          }
+          if (insertNext(ch)) return true;
+        }
+      }
+      return false;
+    }
+    insertNext(structure);
+  }
+
+  function moveNode(nodeId: string, targetId: string, position: "before" | "after" | "into") {
+    if (nodeId === targetId) return;
+    if (isDescendantOf(nodeId, targetId)) return;
+    pushHistory();
+    const nodeData = detachFromStructure(nodeId);
+    insertIntoStructure(nodeId, nodeData, targetId, position);
+    structure = { ...structure };
+  }
+
+  function handleDragStart(e: DragEvent, id: string) {
+    draggedId = id;
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", id);
+    }
+  }
+
+  function handleDragOver(e: DragEvent, id: string) {
+    if (!draggedId || draggedId === id) return;
+    if (isDescendantOf(draggedId, id)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const pct = (e.clientY - rect.top) / rect.height;
+    dragOverId = id;
+    dropEdge = pct < 0.28 ? "before" : pct > 0.72 ? "after" : "into";
+  }
+
+  function handleDragLeave(e: DragEvent) {
+    // Only clear if we're actually leaving the node (not entering a child)
+    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
+      dragOverId = null;
+      dropEdge = null;
+    }
+  }
+
+  function handleDrop(e: DragEvent, id: string) {
+    e.preventDefault();
+    if (!draggedId || draggedId === id || !dropEdge) return;
+    moveNode(draggedId, id, dropEdge);
+    draggedId = null;
+    dragOverId = null;
+    dropEdge = null;
+  }
+
+  function handleDragEnd() {
+    draggedId = null;
+    dragOverId = null;
+    dropEdge = null;
+  }
+
   // ── Tree snippet (recursive) ─────────────────────────────────────────────────
 </script>
 
@@ -697,7 +966,17 @@
       class="tree-node"
       class:selected={isSelected}
       class:modified={modifiedIds.has(id)}
+      class:dragging={draggedId === id}
+      class:drag-over-before={dragOverId === id && dropEdge === "before"}
+      class:drag-over-after={dragOverId === id && dropEdge === "after"}
+      class:drag-over-into={dragOverId === id && dropEdge === "into"}
       style:padding-left="{depth * 14 + 8}px"
+      draggable="true"
+      ondragstart={(e) => handleDragStart(e, id)}
+      ondragover={(e) => handleDragOver(e, id)}
+      ondragleave={(e) => handleDragLeave(e)}
+      ondrop={(e) => handleDrop(e, id)}
+      ondragend={handleDragEnd}
       onclick={() => select(id)}
       role="button"
       tabindex="0"
@@ -717,6 +996,7 @@
       {:else}
         <span class="expand-spacer"></span>
       {/if}
+      <span class="drag-handle" aria-hidden="true">⠿</span>
       <span class="node-name">{name}</span>
       {#if childCount > 0}
         <span class="child-count">{childCount}</span>
@@ -732,13 +1012,24 @@
             class="tree-node leaf"
             class:selected={selectedId === (childId as string)}
             class:modified={modifiedIds.has(childId as string)}
+            class:dragging={draggedId === (childId as string)}
+            class:drag-over-before={dragOverId === (childId as string) && dropEdge === "before"}
+            class:drag-over-after={dragOverId === (childId as string) && dropEdge === "after"}
+            class:drag-over-into={dragOverId === (childId as string) && dropEdge === "into"}
             style:padding-left="{(depth + 1) * 14 + 8}px"
+            draggable="true"
+            ondragstart={(e) => handleDragStart(e, childId as string)}
+            ondragover={(e) => handleDragOver(e, childId as string)}
+            ondragleave={(e) => handleDragLeave(e)}
+            ondrop={(e) => handleDrop(e, childId as string)}
+            ondragend={handleDragEnd}
             onclick={() => select(childId as string)}
             role="button"
             tabindex="0"
             onkeydown={(e) => e.key === "Enter" && select(childId as string)}
           >
             <span class="expand-spacer"></span>
+            <span class="drag-handle" aria-hidden="true">⠿</span>
             <span class="node-name">{childName}</span>
           </div>
         {/each}
@@ -787,7 +1078,7 @@
       >
         {theme === "dark" ? "☀" : "☾"}
       </button>
-      <label class="upload-btn" title="Upload ontology.json">
+      <label class="upload-btn" title="Upload OntMerge v2 JSON">
         ↑ Upload JSON
         <input
           type="file"
@@ -796,6 +1087,9 @@
           onchange={handleFileUpload}
         />
       </label>
+      {#if uploadError && rawOntology}
+        <span class="upload-error-inline">{uploadError}</span>
+      {/if}
       <button class="export-btn" onclick={exportOntology} disabled={!rawOntology}>
         ↓ Export JSON
       </button>
@@ -808,10 +1102,13 @@
       <div class="no-data-card">
         <div class="no-data-title">No ontology loaded</div>
         <div class="no-data-body">
-          Upload an <code>ontology.json</code> file exported from OntMerge to begin editing.
+          Upload a JSON file exported from <code>OntMerge v2</code> to begin editing.
         </div>
+        {#if uploadError}
+          <div class="upload-error">{uploadError}</div>
+        {/if}
         <label class="no-data-upload-btn">
-          Upload ontology.json
+          Upload OntMerge v2 JSON
           <input
             type="file"
             accept=".json"
@@ -1320,6 +1617,27 @@
     opacity: 0.85;
   }
 
+  .upload-error {
+    font-size: 13px;
+    color: #f87171;
+    background: #451a1a;
+    border: 1px solid #7f1d1d;
+    border-radius: 6px;
+    padding: 8px 14px;
+    max-width: 340px;
+    text-align: left;
+    line-height: 1.5;
+  }
+
+  .upload-error-inline {
+    font-size: 12px;
+    color: #f87171;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   /* ── Panels ─────────────────────────────────────────────────────────────────── */
   .panels {
     display: flex;
@@ -1399,6 +1717,37 @@
 
   .tree-node:hover {
     background: var(--bg-hover);
+  }
+
+  .tree-node.dragging {
+    opacity: 0.35;
+  }
+
+  .tree-node.drag-over-before {
+    box-shadow: inset 0 2px 0 0 var(--border-accent);
+  }
+
+  .tree-node.drag-over-after {
+    box-shadow: inset 0 -2px 0 0 var(--border-accent);
+  }
+
+  .tree-node.drag-over-into {
+    background: var(--bg-selected);
+    outline: 1px solid var(--border-accent);
+  }
+
+  .drag-handle {
+    font-size: 11px;
+    color: var(--text-faintest);
+    cursor: grab;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.1s;
+    line-height: 1;
+  }
+
+  .tree-node:hover .drag-handle {
+    opacity: 1;
   }
 
   .tree-node.selected {
