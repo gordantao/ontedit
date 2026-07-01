@@ -108,7 +108,11 @@
         }
         structure[id] = { children: childDict };
       } else {
-        // All children are leaves
+        // All children are leaves — remove the placeholder root entries
+        // that processNode created for each leaf before we collected them here
+        for (const childId of childIds) {
+          delete structure[childId];
+        }
         structure[id] = { children: childIds };
       }
 
